@@ -149,10 +149,89 @@ pub fn member_overload_benchmark(c: &mut Criterion) {
     group.finish();
 }
 
+/// The value of the variable `request` of [`name_lookup_benchmark`].
+fn request() -> HashMap<&'static str, Value> {
+    HashMap::from([
+        ("method", "GET".into()),
+        ("host", "a.example".into()),
+        ("origin", "b.example".into()),
+        ("auth", HashMap::from([("user", "alice")]).into()),
+    ])
+}
+
+const NAME_LOOKUPS: [(&str, &str); 9] = [
+    ("variable", "flag"),
+    ("variable of an outer scope", "limit"),
+    ("field", "request.method"),
+    ("field of an outer scope's variable", "config.region"),
+    ("nested field", "request.auth.user"),
+    ("has", "has(request.method)"),
+    (
+        "fields in a condition",
+        "request.host in hosts && request.origin in hosts",
+    ),
+    ("field in a macro", "hosts.exists(h, h == request.origin)"),
+    ("type", "request.method == 'GET' && type(limit) == int"),
+];
+
+/// The names of an expression, resolved without and with a container.
+///
+/// Most are resolved from an inner scope: variables are added to a root
+/// context once, and each evaluation adds its own in a child scope, as a host
+/// does that evaluates one expression on many inputs. A field is also read in
+/// a root context alone, and in a scope that has a variable resolver.
+pub fn name_lookup_benchmark(c: &mut Criterion) {
+    for (group, container) in [
+        ("name lookup", ""),
+        ("name lookup in a container", "com.example"),
+    ] {
+        let mut group = c.benchmark_group(group);
+        let mut env = Env::stdlib();
+        env.set_container(container).expect("A valid container");
+        let env = Arc::new(env);
+
+        let mut root = Context::with_env(env.clone());
+        root.add_variable_from_value("hosts", vec!["a.example", "b.example", "c.example"]);
+        root.add_variable_from_value("config", HashMap::from([("region", "eu")]));
+        root.add_variable_from_value("limit", 10);
+        let mut shared = root.new_inner_scope();
+        shared.add_variable_from_value("now", 1_700_000_000);
+        let mut inner = shared.new_inner_scope();
+        inner.add_variable_from_value("request", request());
+        inner.add_variable_from_value("flag", true);
+        for (name, expr) in black_box(&NAME_LOOKUPS) {
+            let ast = Parser::default().parse(expr).expect("Parsing failed");
+            group.bench_function(BenchmarkId::from_parameter(name), |b| {
+                b.iter(|| Value::resolve_val(&ast, &inner).expect("Eval failed!"))
+            });
+        }
+
+        let field = Parser::default()
+            .parse("request.method")
+            .expect("Parsing failed");
+        let mut alone = Context::with_env(env.clone());
+        alone.add_variable_from_value("request", request());
+        group.bench_function(
+            BenchmarkId::from_parameter("field, root scope alone"),
+            |b| b.iter(|| Value::resolve_val(&field, &alone).expect("Eval failed!")),
+        );
+
+        let resolver = Resolver::default();
+        let mut resolved = root.new_inner_scope();
+        resolved.set_variable_resolver(&resolver);
+        resolved.add_variable_from_value("request", request());
+        group.bench_function(
+            BenchmarkId::from_parameter("field, scope with a resolver"),
+            |b| b.iter(|| Value::resolve_val(&field, &resolved).expect("Eval failed!")),
+        );
+        group.finish();
+    }
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = criterion_benchmark, criterion_benchmark_parsing, map_macro_benchmark, member_overload_benchmark
+    targets = criterion_benchmark, criterion_benchmark_parsing, map_macro_benchmark, member_overload_benchmark, name_lookup_benchmark
 }
 
 #[cfg(feature = "dhat-heap")]
