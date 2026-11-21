@@ -70,6 +70,7 @@ mod tests {
     use crate::extractors::Arguments;
     use crate::parser::Macro;
     use crate::{Context, Env, ExecutionError, FunctionContext, IdedExpr, Value};
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -332,6 +333,17 @@ mod tests {
         let mut context = Context::with_env(Arc::new(env));
         context.add_variable_from_value("@index9.a", Value::Int(42));
         assert_eq!(program.execute(&context), Ok(Value::Int(42)));
+    }
+
+    #[test]
+    fn a_slot_is_not_shadowed_by_a_variable_of_an_inner_scope() {
+        let env = with_block_macros(env());
+        let program = env.compile("block([{'a': 1}], index(0).a)").unwrap();
+        let root = Context::with_env(Arc::new(env));
+        let mut inner = root.new_inner_scope();
+        inner.add_variable_from_value("@index0", HashMap::from([("a", 2)]));
+        inner.add_variable_from_value("@index0.a", Value::Int(3));
+        assert_eq!(program.execute(&inner), Ok(Value::Int(1)));
     }
 
     #[test]

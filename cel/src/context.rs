@@ -354,6 +354,38 @@ impl<'p, 'v> Context<'p, 'v> {
         )))
     }
 
+    /// Fast path of [`Self::resolve_qualified`] for a name of two segments,
+    /// `root.field`, the most common qualified name: the same value, with
+    /// `field` if it is left to select on it, or the same error.
+    ///
+    /// It is the same resolution, scope by scope, without the two allocations
+    /// of the general path: the segments are its arguments, and the name is
+    /// joined in a buffer on the stack. `None` leaves a name longer than
+    /// [`MAX_JOINED_NAME_LEN`], which does not fit that buffer, to
+    /// `resolve_qualified`.
+    pub(crate) fn resolve_qualified_fast_path<'b, 'f>(
+        &'b self,
+        root: &str,
+        field: &'f str,
+    ) -> Option<Result<Selected<'b, 'v, 'f>, ExecutionError>> {
+        let mut buffer = [0u8; MAX_JOINED_NAME_LEN];
+        let whole_name = join_name_into(&mut buffer, root, field)?;
+        let env = self.env();
+        for scope in self.scopes_for(whole_name) {
+            // The most specific name wins: the variable, or type, `root.field`
+            if let Some(value) = scope.resolve_own(env, whole_name, true) {
+                return Some(Ok((value, None)));
+            }
+            // else the variable `root`, with `field` left to select on it
+            if let Some(value) = scope.resolve_own(env, root, false) {
+                return Some(Ok((value, Some(field))));
+            }
+        }
+        Some(Err(ExecutionError::UndeclaredReference(Arc::new(
+            root.to_owned(),
+        ))))
+    }
+
     /// The variable of this scope named by a container candidate of `name`,
     /// else, in the root scope, the type, if `may_be_type`. `env` is
     /// [`Self::env`], which the caller looks up once for all the scopes.
@@ -558,10 +590,37 @@ impl<'p, 'v> Context<'p, 'v> {
     }
 }
 
+/// What [`Context::resolve_qualified_fast_path`] resolves `root.field` to: a
+/// value, and `field` if it is left to select on it.
+pub(crate) type Selected<'b, 'v, 'f> = (CowVal<'b, 'v>, Option<&'f str>);
+
 /// The type `name` names in `env`, as a value.
 fn type_named<'b, 'v>(env: &Env, name: &str) -> Option<CowVal<'b, 'v>> {
     let t = env.types().find_type(name)?;
     Some(CowVal::owned(CelType::from(t)))
+}
+
+/// The longest name, in bytes, that [`Context::resolve_qualified_fast_path`]
+/// resolves: the size of the buffer it joins the name in.
+const MAX_JOINED_NAME_LEN: usize = 64;
+
+/// The name `root.field`, written into `buffer`, which the caller has on the
+/// stack, so that it is not allocated. `None` if it does not fit.
+fn join_name_into<'a>(
+    buffer: &'a mut [u8; MAX_JOINED_NAME_LEN],
+    root: &str,
+    field: &str,
+) -> Option<&'a str> {
+    let len = root.len() + 1 + field.len();
+    if len > buffer.len() {
+        return None;
+    }
+    let (root_end, field_start) = (root.len(), root.len() + 1);
+    buffer[..root_end].copy_from_slice(root.as_bytes());
+    buffer[root_end] = b'.';
+    buffer[field_start..len].copy_from_slice(field.as_bytes());
+    // Two strings joined by a dot are a string: this is never `None`
+    std::str::from_utf8(&buffer[..len]).ok()
 }
 
 impl Default for Context<'_, '_> {
@@ -655,9 +714,12 @@ impl<T: VariableResolver> VariableResolver for &T {
 
 #[cfg(test)]
 mod test {
-    use super::{Context, VariableResolver};
-    use crate::common::types::CelString;
+    use super::{join_name_into, Context, VariableResolver, MAX_JOINED_NAME_LEN};
+    use crate::common::types::{CelInt, CelString, Type};
     use crate::common::value::CowVal;
+    use crate::{Env, ExecutionError, Program, Value};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
     // A helper function that requires T to implement some traits
     fn assert_send<T: Send>() {}
@@ -945,5 +1007,180 @@ mod test {
         let context = Context::default();
         assert!(context.get_variable("int").is_none());
         assert!(context.new_inner_scope().get_variable("int").is_none());
+    }
+
+    #[test]
+    fn join_name_into_joins_a_name_that_fits() {
+        let mut buffer = [0u8; MAX_JOINED_NAME_LEN];
+        assert_eq!(join_name_into(&mut buffer, "a", "b"), Some("a.b"));
+        assert_eq!(join_name_into(&mut buffer, "", "b"), Some(".b"));
+        assert_eq!(join_name_into(&mut buffer, "é", "ü"), Some("é.ü"));
+        // the dot takes one byte
+        let fits = "f".repeat(MAX_JOINED_NAME_LEN - 2);
+        let joined = format!("a.{fits}");
+        assert_eq!(
+            join_name_into(&mut buffer, "a", &fits),
+            Some(joined.as_str())
+        );
+        assert_eq!(
+            join_name_into(&mut buffer, &fits, "a").map(str::len),
+            Some(MAX_JOINED_NAME_LEN)
+        );
+        let long = "f".repeat(MAX_JOINED_NAME_LEN - 1);
+        assert_eq!(join_name_into(&mut buffer, "a", &long), None);
+        assert_eq!(join_name_into(&mut buffer, &long, "a"), None);
+        assert_eq!(join_name_into(&mut buffer, &long, &long), None);
+    }
+
+    /// A name resolves the same whatever its length: the longest one that is
+    /// joined without an allocation, one byte more, and many more.
+    #[test]
+    fn a_long_name_resolves_as_a_short_one() {
+        let fits = MAX_JOINED_NAME_LEN - "a.".len();
+        for len in [fits, fits + 1, 4 * fits] {
+            let field = "f".repeat(len);
+            let name = format!("a.{field}");
+            let program = Program::compile(&name).unwrap();
+            let root = Context::default();
+            let mut child = root.new_inner_scope();
+            child.add_variable_from_value("a", HashMap::from([(field, 1)]));
+            assert_eq!(program.execute(&child), Ok(Value::Int(1)));
+            child.add_variable_from_value(name, 2);
+            assert_eq!(program.execute(&child), Ok(Value::Int(2)));
+        }
+    }
+
+    /// A resolver of the variables `a`, `a.b` and `x.a`, which keeps the
+    /// names it is asked for.
+    struct Recorder {
+        variables: [(&'static str, CelInt); 3],
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl Recorder {
+        fn new() -> Self {
+            Recorder {
+                variables: [
+                    ("a", CelInt::from(1000)),
+                    ("a.b", CelInt::from(1001)),
+                    ("x.a", CelInt::from(1002)),
+                ],
+                asked: Mutex::default(),
+            }
+        }
+
+        /// The names asked for since the last call.
+        fn asked(&self) -> Vec<String> {
+            std::mem::take(&mut self.asked.lock().unwrap())
+        }
+    }
+
+    impl VariableResolver for Recorder {
+        fn resolve<'b>(&'b self, variable: &str) -> Option<CowVal<'b, 'b>> {
+            self.asked.lock().unwrap().push(variable.to_owned());
+            let (_, value) = self.variables.iter().find(|(name, _)| *name == variable)?;
+            Some(CowVal::Borrowed(value))
+        }
+    }
+
+    /// Checks that `resolve_qualified_fast_path` resolves every `root.field` as
+    /// `resolve_qualified` does: to the same value and field left, or the
+    /// same error, asking the resolver for the same names. The contexts are
+    /// every layout of `names` over three scopes, each variable a different
+    /// int, with the resolver on none or one of the scopes.
+    fn assert_fast_path_agrees(env: Env, names: [&str; 5]) {
+        fn fill<'v>(
+            scope: &mut Context<'_, 'v>,
+            names: [&str; 5],
+            (depth, layout): (usize, usize),
+            resolver: Option<&'v Recorder>,
+        ) {
+            for (i, name) in names.into_iter().enumerate() {
+                if layout & (1 << i) != 0 {
+                    scope.add_variable_from_value(name, (depth * 10 + i) as i64);
+                }
+            }
+            if let Some(resolver) = resolver {
+                scope.set_variable_resolver(resolver);
+            }
+        }
+        type Resolved = Result<(Value, Vec<String>), ExecutionError>;
+        fn resolved(value: CowVal, fields: &[&str]) -> Resolved {
+            let fields = fields.iter().map(|field| field.to_string()).collect();
+            Ok((value.as_ref().try_into()?, fields))
+        }
+
+        const LAYOUTS: usize = 1 << 5;
+        let env = Arc::new(env);
+        let resolver = Recorder::new();
+        let roots = ["a", ".a", "", "x", "y"];
+        for layouts in 0..LAYOUTS.pow(3) {
+            for resolves in [None, Some(0), Some(1), Some(2)] {
+                let at = |depth| (resolves == Some(depth)).then_some(&resolver);
+                let mut root = Context::with_env(env.clone());
+                fill(&mut root, names, (0, layouts % LAYOUTS), at(0));
+                let mut middle = root.new_inner_scope();
+                fill(&mut middle, names, (1, layouts / LAYOUTS % LAYOUTS), at(1));
+                let mut inner = middle.new_inner_scope();
+                fill(&mut inner, names, (2, layouts / LAYOUTS / LAYOUTS), at(2));
+                for (name, field) in roots
+                    .into_iter()
+                    .flat_map(|root| [(root, "a"), (root, "b")])
+                {
+                    let expected: Resolved = inner
+                        .resolve_qualified(&[name, field])
+                        .and_then(|(value, fields)| resolved(value, fields));
+                    let expected = (expected, resolver.asked());
+                    let selected: Resolved = inner
+                        .resolve_qualified_fast_path(name, field)
+                        .expect("a short name")
+                        .and_then(|(value, field)| resolved(value, field.as_slice()));
+                    assert_eq!(
+                        (selected, resolver.asked()),
+                        expected,
+                        "{name}.{field}, layouts {layouts}, resolver in {resolves:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_fast_path_agrees_with_resolve_qualified() {
+        let mut env = Env::stdlib();
+        env.add_type(Type::new_opaque_type("a.b")).unwrap();
+        env.add_type(Type::new_opaque_type("y")).unwrap();
+        assert_fast_path_agrees(env, ["a", "a.b", "a.a", ".a", ""]);
+    }
+
+    #[test]
+    fn the_fast_path_agrees_with_resolve_qualified_in_a_container() {
+        let mut env = Env::stdlib();
+        env.set_container("x").unwrap();
+        env.add_type(Type::new_opaque_type("x.a.b")).unwrap();
+        env.add_type(Type::new_opaque_type("x.y")).unwrap();
+        assert_fast_path_agrees(env, ["a", "a.b", "x.a", "x.a.b", "x.x"]);
+    }
+
+    /// A name that is not declared is asked of a resolver once, as each of
+    /// the two names it may be.
+    #[test]
+    fn an_undeclared_selection_asks_the_resolver_once() {
+        let resolver = Recorder::new();
+        let mut context = Context::default();
+        context.set_variable_resolver(&resolver);
+        let program = Program::compile("y.b").unwrap();
+        assert!(matches!(
+            program.execute(&context),
+            Err(ExecutionError::UndeclaredReference(_))
+        ));
+        assert_eq!(resolver.asked(), ["y.b", "y"]);
+    }
+
+    #[test]
+    fn the_fast_path_leaves_a_long_name_to_resolve_qualified() {
+        let context = Context::default();
+        let long = "f".repeat(MAX_JOINED_NAME_LEN);
+        assert!(context.resolve_qualified_fast_path("a", &long).is_none());
     }
 }

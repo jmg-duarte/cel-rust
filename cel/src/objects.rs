@@ -1466,18 +1466,35 @@ impl Value {
                     .ok_or_else(|| ExecutionError::UndeclaredReference(Arc::new(name.to_string())))
             }
             Expr::Select(select) => {
+                // A slot isn't in the context: select from it as from any value
+                let is_slot = |name: &str| {
+                    frame
+                        .zip(slot_index(name))
+                        .is_some_and(|(frame, index)| frame.has(index))
+                };
+                // Fast path: `root.field`, the most common selection, resolved
+                // without collecting the segments of its name. Not for
+                // `has(root.field)`, which tests for the field, nor for a slot.
+                let fast_path_root = match &select.operand.expr {
+                    Expr::Ident(root) if !select.test && !is_slot(root) => Some(root),
+                    _ => None,
+                };
+                if let Some(root) = fast_path_root {
+                    if let Some(selected) = ctx.resolve_qualified_fast_path(root, &select.field) {
+                        return match selected? {
+                            (value, Some(field)) => select_field(value, field, false),
+                            (value, None) => Ok(value),
+                        };
+                    }
+                }
+                // General path: any selection, by the segments of its name.
                 // `has(a.b.c)` tests for `c` on `a.b`: only its operand is a name
                 let name = if select.test {
                     select.operand.expr.qualified_name_segments()
                 } else {
                     expr.expr.qualified_name_segments()
                 };
-                // A slot isn't in the context: select from it as from any value
-                let name = name.filter(|segments| {
-                    !frame
-                        .zip(slot_index(segments[0]))
-                        .is_some_and(|(frame, index)| frame.has(index))
-                });
+                let name = name.filter(|segments| !is_slot(segments[0]));
                 let Some(name) = name else {
                     let left = Value::resolve_in(select.operand.deref(), ctx, frame)?;
                     return select_field(left, &select.field, select.test);
@@ -4291,6 +4308,7 @@ mod tests {
     }
 
     mod scopes {
+        use crate::common::ast::{Expr, IdedExpr, SelectExpr};
         use crate::{Context, ExecutionError, Program, Value};
         use std::collections::HashMap;
         use std::sync::Arc;
@@ -4344,6 +4362,70 @@ mod tests {
             let mut child = root.new_inner_scope();
             child.add_variable_from_value("a.b", 2);
             assert_eq!(execute(&child, "a.b"), Ok(Value::Int(2)));
+        }
+
+        /// Within a scope, `a.b` is the variable `a.b`, else the field `b` of
+        /// the variable `a`.
+        #[test]
+        fn a_dotted_variable_wins_over_a_field_within_a_scope() {
+            let root = Context::default();
+            let mut child = root.new_inner_scope();
+            child.add_variable_from_value("a", HashMap::from([("b", 1), ("c", 2)]));
+            child.add_variable_from_value("a.b", 3);
+            assert_eq!(execute(&child, "a.b"), Ok(Value::Int(3)));
+            assert_eq!(execute(&child, "a.c"), Ok(Value::Int(2)));
+            assert_eq!(execute(&child, "x.b"), undeclared("x"));
+        }
+
+        /// An absolute `.a.b` skips an inner scope, whatever its variables
+        /// are named.
+        #[test]
+        fn a_leading_dot_selection_skips_inner_scopes() {
+            let mut root = Context::default();
+            root.add_variable_from_value("a", HashMap::from([("b", 1)]));
+            let mut child = root.new_inner_scope();
+            child.add_variable_from_value("a", HashMap::from([("b", 2)]));
+            child.add_variable_from_value(".a", HashMap::from([("b", 3)]));
+            assert_eq!(execute(&child, "a.b"), Ok(Value::Int(2)));
+            assert_eq!(execute(&child, ".a.b"), Ok(Value::Int(1)));
+        }
+
+        /// A selection on an empty identifier, which only an expression built
+        /// by hand has, spells `.b`: an absolute name.
+        #[test]
+        fn a_selection_on_an_empty_identifier_is_absolute() {
+            let expr = IdedExpr {
+                id: 1,
+                expr: Expr::Select(SelectExpr {
+                    operand: Box::new(IdedExpr {
+                        id: 2,
+                        expr: Expr::Ident(String::new()),
+                    }),
+                    field: "b".to_owned(),
+                    test: false,
+                }),
+            };
+            let mut root = Context::default();
+            root.add_variable_from_value("b", 1);
+            let mut child = root.new_inner_scope();
+            child.add_variable_from_value("", HashMap::from([("b", 2)]));
+            child.add_variable_from_value(".b", 3);
+            assert_eq!(Value::resolve(&expr, &child), Ok(Value::Int(1)));
+        }
+
+        /// `has(a.b)` tests for the field `b`, and does not select it, also
+        /// when `a` is a variable of an inner scope.
+        #[test]
+        fn has_tests_a_field_of_a_variable_of_an_inner_scope() {
+            let root = Context::default();
+            let mut child = root.new_inner_scope();
+            child.add_variable_from_value("a", HashMap::from([("b", 1)]));
+            assert_eq!(execute(&child, "has(a.b)"), Ok(Value::Bool(true)));
+            assert_eq!(execute(&child, "has(a.c)"), Ok(Value::Bool(false)));
+            assert_eq!(
+                execute(&root, "[{'b': 1}].all(x, has(x.b) && !has(x.c))"),
+                Ok(Value::Bool(true))
+            );
         }
 
         #[test]
